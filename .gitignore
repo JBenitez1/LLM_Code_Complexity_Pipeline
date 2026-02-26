@@ -1,2 +1,5 @@
 .venv/
 CodeComplex-Data/
+__pycache__/
+.ipynb_checkpoints/
+.env

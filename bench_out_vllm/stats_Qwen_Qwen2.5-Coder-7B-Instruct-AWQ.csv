@@ -1,0 +1,2 @@
+model,examples,skipped,errors,accuracy,f1_macro,prompt_tokens_total,gen_tokens_total,elapsed_s_total,prefill_tok_per_s,decode_tok_per_s,total_tok_per_s,max_tokens,temperature,base_url,cache_salt,system_sha1,system_len_chars
+Qwen/Qwen2.5-Coder-7B-Instruct-AWQ,8902,0,898,0.41451359245113456,0.3057335950728747,10305115,129494,2080.8772381500203,4952.29358612315,62.230485117481095,5014.524071240631,32,0.0,http://localhost:8000,,6d6c03ab91bcf098d755ebc570952bd9d282beb9,3794
