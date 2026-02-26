@@ -1,0 +1,10 @@
+model,total_tokens,avg_tokens,skipped,counted
+meta-llama/Llama-3.1-8B-Instruct,11772544,1201.28,0,9800
+Qwen/Qwen2.5-Coder-7B-Instruct,6840326,697.9924489795918,0,9800
+openai/gpt-oss-20b,6869918,701.0120408163265,0,9800
+meta-llama/Llama-3.2-3B-Instruct,11772544,1201.28,0,9800
+deepseek-ai/deepseek-coder-6.7b-instruct,8760083,893.8860204081633,0,9800
+deepseek-ai/DeepSeek-R1-0528-Qwen3-8B,6840326,697.9924489795918,0,9800
+Qwen/Qwen3-8B,6840326,697.9924489795918,0,9800
+bigcode/starcoder2-7b,7667566,782.404693877551,0,9800
+deepseek-ai/deepseek-coder-1.3b-instruct,8760083,893.8860204081633,0,9800
