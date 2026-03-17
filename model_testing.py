@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
 """
-Single-file vLLM benchmark runner (self-contained).
+Single-file llama.cpp benchmark runner (self-contained).
 
 What it does:
-- Assumes a vLLM OpenAI-compatible API server is already running (default: http://localhost:8000).
+- Loads a local GGUF model with `llama_cpp`.
 - Loads CodeComplex JSONL datasets from CodeComplex-Data/{java_data.jsonl,python_data.jsonl}.
-- Builds prompts as chat messages (system = static rubric, user = per-example code) to maximize vLLM prefix caching.
-- Sends requests to /v1/chat/completions.
+- Builds a single prompt from the existing system/user instructions.
+- Runs local completions through llama.cpp.
 - Parses JSON {"complexity": "..."} from responses.
 - Writes:
   1) outputs_<model>.csv  (per-example predictions + latency + token usage + raw response)
   2) stats_<model>.csv    (aggregate metrics + classification report + confusion matrix)
 
 Run:
-  python bench_vllm_singlefile.py --model Qwen/Qwen2.5-Coder-7B-Instruct-AWQ
+  python model_testing.py --model /path/to/model.gguf
 
 Optional:
-  python bench_vllm_singlefile.py --model ... --limit 50
-  python bench_vllm_singlefile.py --cache-salt run1  (to isolate prefix caching between runs)
+  python model_testing.py --model /path/to/model.gguf --limit 50
 """
 
 import os
@@ -27,12 +26,14 @@ import json
 import time
 import argparse
 import hashlib
-from typing import List, Dict, Any, Optional
+import subprocess
+from typing import List, Dict, Any
 
-import requests
 import numpy as np
 from tqdm import tqdm
 from datasets import load_dataset
+import llama_cpp
+from llama_cpp import Llama
 from sklearn.metrics import accuracy_score, f1_score, classification_report, confusion_matrix
 
 
@@ -117,20 +118,20 @@ SYSTEM_PROMPT_SIMPLE = SYSTEM_BASE_INTRO.format(
 )
 
 
-def build_messages_simple(src: str) -> List[Dict[str, str]]:
-    """
-    Split into system/user messages to maximize vLLM prefix caching.
-    """
+def build_prompt_simple(src: str) -> str:
     user = (
         "Determine the time complexity of the following code and return ONLY the JSON vote.\n\n"
         "```text\n"
         f"{src}\n"
         "```"
     )
-    return [
-        {"role": "system", "content": SYSTEM_PROMPT_SIMPLE},
-        {"role": "user", "content": user},
-    ]
+    return (
+        "<|system|>\n"
+        f"{SYSTEM_PROMPT_SIMPLE}\n"
+        "<|user|>\n"
+        f"{user}\n"
+        "<|assistant|>\n"
+    )
 
 
 # -----------------------------
@@ -144,6 +145,20 @@ def sha1(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8")).hexdigest()
 
 
+def build_model_output_tag(model_path: str) -> str:
+    """
+    Create a stable, readable output tag per model file.
+
+    Uses the model filename stem for readability and appends a short hash of the
+    full path so different files with the same basename do not collide.
+    """
+    model_file = os.path.basename(model_path)
+    model_stem, _ = os.path.splitext(model_file)
+    readable_tag = safe_name(model_stem) or "model"
+    short_hash = sha1(os.path.abspath(model_path))[:8]
+    return f"{readable_tag}_{short_hash}"
+
+
 def check_data_files():
     missing = [k for k, p in JSONL_FILES.items() if not os.path.exists(p)]
     if missing:
@@ -151,6 +166,60 @@ def check_data_files():
             f"Missing JSONL files for: {', '.join(missing)}. "
             f"Expected under {REPO_DIR}/. Clone repo and ensure files exist."
         )
+
+
+def verify_cuda_requested(n_gpu_layers: int) -> None:
+    """
+    Fail fast when GPU offload is requested but the environment does not appear CUDA-ready.
+    """
+    if n_gpu_layers == 0:
+        return
+
+    try:
+        completed = subprocess.run(
+            ["nvidia-smi"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "CUDA was requested, but `nvidia-smi` is not available. "
+            "Install NVIDIA drivers/CUDA and a CUDA-enabled llama-cpp-python build."
+        ) from exc
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or "").strip()
+        raise RuntimeError(
+            "CUDA was requested, but `nvidia-smi` failed. "
+            f"Details: {stderr or 'unknown error'}"
+        ) from exc
+
+    if "failed to initialize nvml" in completed.stderr.lower():
+        raise RuntimeError(
+            "CUDA was requested, but NVML could not initialize. "
+            "The GPU driver stack is not healthy in this environment."
+        )
+
+
+def print_runtime_config(args: argparse.Namespace) -> None:
+    gpu_support = "unknown"
+    try:
+        gpu_support = str(llama_cpp.llama_cpp.llama_supports_gpu_offload())
+    except Exception:
+        pass
+
+    print("llama.cpp runtime configuration:")
+    print(f"  llama_cpp version: {getattr(llama_cpp, '__version__', 'unknown')}")
+    print(f"  llama_cpp module:  {getattr(llama_cpp, '__file__', 'unknown')}")
+    print(f"  GPU offload build: {gpu_support}")
+    print(f"  model:             {args.model}")
+    print(f"  n_ctx:             {args.n_ctx}")
+    print(f"  n_batch:           {args.n_batch}")
+    print(f"  n_gpu_layers:      {args.n_gpu_layers}")
+    print(f"  threads:           {args.threads if args.threads > 0 else 'default'}")
+    print(f"  temperature:       {args.temperature}")
+    print(f"  max_tokens:        {args.max_tokens}")
+    print(f"  outdir:            {args.outdir}")
 
 
 def load_data():
@@ -204,42 +273,36 @@ def write_csv(path: str, rows: List[Dict[str, Any]]):
         with open(path, "w", newline="", encoding="utf-8") as f:
             f.write("")
         return
-    fieldnames = list(rows[0].keys())
+    fieldnames: List[str] = []
+    seen = set()
+    for row in rows:
+        for key in row.keys():
+            if key not in seen:
+                seen.add(key)
+                fieldnames.append(key)
     with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         w.writeheader()
         for r in rows:
             w.writerow(r)
 
 
-def call_vllm_chat(
-    base_url: str,
-    model: str,
-    messages: List[Dict[str, str]],
+def call_llama_cpp_completion(
+    llm: Llama,
+    prompt: str,
     max_tokens: int,
     temperature: float,
-    cache_salt: Optional[str] = None,
-    timeout_s: int = 300,
 ) -> Dict[str, Any]:
-    url = base_url.rstrip("/") + "/v1/chat/completions"
-    payload: Dict[str, Any] = {
-        "model": model,
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-    }
-    # vLLM supports cache_salt to isolate prefix caching across runs if you want
-    if cache_salt:
-        payload["cache_salt"] = cache_salt
-
     t0 = time.perf_counter()
-    r = requests.post(url, json=payload, timeout=timeout_s)
+    data = llm.create_completion(
+        prompt=prompt,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        stop=["<|user|>", "<|system|>"],
+    )
     t1 = time.perf_counter()
 
-    r.raise_for_status()
-    data = r.json()
-
-    text = data["choices"][0]["message"]["content"]
+    text = data["choices"][0]["text"]
     usage = data.get("usage", {})  # {prompt_tokens, completion_tokens, total_tokens}
     return {
         "text": text,
@@ -254,17 +317,35 @@ def call_vllm_chat(
 # -----------------------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--base-url", default="http://localhost:8000", help="vLLM server base URL")
-    ap.add_argument("--model", required=True, help="Model name as served by vLLM")
-    ap.add_argument("--outdir", default="bench_out_vllm", help="Output directory")
+    ap.add_argument("--model", required=True, help="Path to local GGUF model for llama.cpp")
+    ap.add_argument("--outdir", default="bench_out_llamacpp", help="Output directory")
     ap.add_argument("--max-tokens", type=int, default=32, help="Max output tokens")
     ap.add_argument("--temperature", type=float, default=0.0, help="0.0 for deterministic")
     ap.add_argument("--limit", type=int, default=0, help="Limit examples per split (0 = all)")
-    ap.add_argument("--cache-salt", default="", help="Optional salt to isolate prefix caching")
-    ap.add_argument("--timeout", type=int, default=300, help="HTTP timeout per request (seconds)")
+    ap.add_argument("--n-ctx", type=int, default=4096, help="llama.cpp context size")
+    ap.add_argument("--n-batch", type=int, default=512, help="llama.cpp batch size")
+    ap.add_argument("--n-gpu-layers", type=int, default=-1, help="Number of layers to offload to GPU (-1 = all)")
+    ap.add_argument("--threads", type=int, default=0, help="CPU threads to use (0 = llama.cpp default)")
+    ap.add_argument("--seed", type=int, default=0, help="Random seed")
+    ap.add_argument("--verbose", action="store_true", help="Enable llama.cpp verbose logging")
     args = ap.parse_args()
 
     os.makedirs(args.outdir, exist_ok=True)
+    verify_cuda_requested(args.n_gpu_layers)
+    print_runtime_config(args)
+
+    llm_kwargs: Dict[str, Any] = {
+        "model_path": args.model,
+        "n_ctx": args.n_ctx,
+        "n_batch": args.n_batch,
+        "n_gpu_layers": args.n_gpu_layers,
+        "seed": args.seed,
+        "verbose": args.verbose,
+    }
+    if args.threads > 0:
+        llm_kwargs["n_threads"] = args.threads
+
+    llm = Llama(**llm_kwargs)
 
     check_data_files()
     dataset_dict = load_data()
@@ -295,7 +376,7 @@ def main():
     for split_name, ds in dataset_dict.items():
         ds_iter = list(ds)[:args.limit] if args.limit and args.limit > 0 else list(ds)
 
-        for ex in tqdm(ds_iter, desc=f"vLLM inference [{split_name}]"):
+        for ex in tqdm(ds_iter, desc=f"llama.cpp inference [{split_name}]"):
             code = extract_code_snippet(ex)
             true_label = ex.get("complexity")
 
@@ -303,18 +384,15 @@ def main():
                 skipped += 1
                 continue
 
-            messages = build_messages_simple(code)
+            prompt = build_prompt_simple(code)
             ex_id = ex.get("id", "")
 
             try:
-                result = call_vllm_chat(
-                    base_url=args.base_url,
-                    model=args.model,
-                    messages=messages,
+                result = call_llama_cpp_completion(
+                    llm=llm,
+                    prompt=prompt,
                     max_tokens=args.max_tokens,
                     temperature=args.temperature,
-                    cache_salt=(args.cache_salt or None),
-                    timeout_s=args.timeout,
                 )
 
                 text = result["text"]
@@ -351,7 +429,7 @@ def main():
                     "code_len_chars": len(code),
                     "system_sha1": system_sha,
                     "system_len_chars": system_len_chars,
-                    "user_sha1": sha1(messages[1]["content"]),
+                    "user_sha1": sha1(prompt),
                     "response_text": text,
                 })
             except Exception as e:
@@ -370,13 +448,13 @@ def main():
                     "code_len_chars": len(code) if isinstance(code, str) else 0,
                     "system_sha1": system_sha,
                     "system_len_chars": system_len_chars,
-                    "user_sha1": sha1(messages[1]["content"]) if isinstance(code, str) else "",
+                    "user_sha1": sha1(prompt) if isinstance(code, str) else "",
                     "response_text": f"ERROR: {repr(e)}",
                 })
 
     # Summary stats
     stats_rows: List[Dict[str, Any]] = []
-    model_tag = safe_name(args.model)
+    model_tag = build_model_output_tag(args.model)
 
     if n_examples == 0:
         stats_rows.append({
@@ -384,7 +462,7 @@ def main():
             "examples": 0,
             "skipped": skipped,
             "errors": n_errors,
-            "base_url": args.base_url,
+            "backend": "llama.cpp",
         })
     else:
         acc = accuracy_score(y_true_all, y_pred_all)
@@ -409,8 +487,12 @@ def main():
             "total_tok_per_s": float(total_tps),
             "max_tokens": args.max_tokens,
             "temperature": args.temperature,
-            "base_url": args.base_url,
-            "cache_salt": args.cache_salt,
+            "backend": "llama.cpp",
+            "n_ctx": args.n_ctx,
+            "n_batch": args.n_batch,
+            "n_gpu_layers": args.n_gpu_layers,
+            "threads": args.threads,
+            "seed": args.seed,
             "system_sha1": system_sha,
             "system_len_chars": system_len_chars,
         })
