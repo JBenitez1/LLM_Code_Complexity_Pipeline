@@ -12,7 +12,7 @@ MODEL_PATHS=(
 
 for MODEL_PATH in "${MODEL_PATHS[@]}"; do
     if [ -f "$MODEL_PATH" ]; then
-        python3 model_testing.py --model "$MODEL_PATH" --limit 10
+        python3 model_testing.py --model "$MODEL_PATH"
     else
         echo "Model File Not Found: $MODEL_PATH"
     fi
